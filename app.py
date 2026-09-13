@@ -1,12 +1,10 @@
 """
-app.py — TikTok → MP4 downloader with verbose logging for Render.
-
-Every log line is flushed to stdout immediately so it shows up in
-Render's log viewer in real time.
+app.py — TikTok → MP4 downloader with web UI and public API.
 
 Endpoints:
     GET  /                      -> UI
-    POST /api/fetch             -> fetch a TikTok, save MP4
+    POST /api/fetch             -> fetch (for the UI, no auth)
+    POST /api/v1/fetch          -> public API (optional API key)
     GET  /download/<filename>   -> serve saved MP4
     GET  /api/logs              -> live log lines for the UI
     GET  /healthz               -> health check for Render
@@ -27,7 +25,6 @@ from urllib.parse import urlparse, parse_qs
 
 # Enable Playwright's own debug logging BEFORE importing it.
 # Streams to stderr -> captured by Render.
-# Set to "pw:api" for every action, or "pw:browser" for just browser events.
 os.environ.setdefault("DEBUG", "pw:api")
 
 from flask import (
@@ -62,7 +59,7 @@ class _FlushingStreamHandler(logging.StreamHandler):
     """
     StreamHandler that flushes after every emit.
     Required on Render — stdout is buffered when not attached to a TTY,
-    so logs otherwise sit in a 4KB buffer and appear 'delayed'.
+    so logs otherwise sit in a buffer and appear 'delayed'.
     """
     def emit(self, record):
         super().emit(record)
@@ -93,7 +90,6 @@ def setup_logging(level: int = logging.INFO, log_file: str | None = None) -> log
             fh.addFilter(rid_filter)
             root.addHandler(fh)
         except Exception as e:
-            # Don't crash startup if the filesystem is read-only
             print(f"[warn] Could not create file log {log_file}: {e}", file=sys.stderr)
 
     # Quiet noisy libraries
@@ -140,6 +136,18 @@ def _install_buffer_handler():
 # Config
 # ===========================================================================
 DOWNLOAD_DIR = os.path.abspath("./downloads")
+
+# ---------------------------------------------------------------------------
+# Public API config
+# ---------------------------------------------------------------------------
+# Set API_KEY in Render env vars to require a key on /api/v1/*
+# Leave it UNSET for open access (dev/local).
+API_KEY = os.getenv("API_KEY", "").strip()
+
+# Public base URL for building absolute download links.
+# If unset, it's inferred from the incoming request's Host header.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
 
 @dataclass
 class FetchConfig:
@@ -210,6 +218,39 @@ def _human_size(n: int) -> str:
     return f"{n:.2f} TB"
 
 
+def _absolute_download_url(filename: str) -> str:
+    """Build an absolute URL to /download/<filename>."""
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/download/{filename}"
+    return f"{request.host_url.rstrip('/')}/download/{filename}"
+
+
+def _check_api_key() -> tuple[bool, str | None]:
+    """
+    Validate the API key if one is configured.
+    Accepts either:
+      - header:  X-API-Key: <key>
+      - query:   ?api_key=<key>
+
+    Returns (ok, error_message).
+    If API_KEY is empty -> auth is disabled -> always OK.
+    """
+    if not API_KEY:
+        return True, None
+
+    provided = (
+        request.headers.get("X-API-Key")
+        or request.args.get("api_key")
+        or ""
+    ).strip()
+
+    if not provided:
+        return False, "Missing API key (send X-API-Key header or ?api_key=)"
+    if provided != API_KEY:
+        return False, "Invalid API key"
+    return True, None
+
+
 # ===========================================================================
 # Fetcher
 # ===========================================================================
@@ -265,7 +306,7 @@ def _fetch_once(tiktok_url: str, cfg: FetchConfig) -> FetchResult:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--no-zygote",
-                "--single-process",              # helps with limited memory
+                "--single-process",
                 # Clipboard permissions
                 "--enable-features=ClipboardReadWrite",
                 "--disable-features=ClipboardPermissionPrompt",
@@ -439,6 +480,9 @@ def healthz():
     return "ok", 200
 
 
+# ---------------------------------------------------------------------------
+# UI endpoint (no auth)
+# ---------------------------------------------------------------------------
 @app.route("/api/fetch", methods=["POST"])
 def api_fetch():
     rid = uuid.uuid4().hex[:8]
@@ -447,7 +491,7 @@ def api_fetch():
     data = request.get_json(silent=True) or {}
     tiktok_url = (data.get("url") or "").strip()
 
-    log.info(">>> INCOMING REQUEST %s: %s", rid, tiktok_url)
+    log.info(">>> UI REQUEST %s: %s", rid, tiktok_url)
 
     if not tiktok_url:
         log.warning("Missing url parameter")
@@ -461,7 +505,7 @@ def api_fetch():
         result = fetch_tiktok_video(tiktok_url, FETCH_CFG)
 
     if not result:
-        log.error("<<< REQUEST %s FAILED", rid)
+        log.error("<<< UI REQUEST %s FAILED", rid)
         return jsonify(ok=False, error="Fetch failed. Check the server log."), 502
 
     own_url = f"/download/{result.filename}"
@@ -469,10 +513,102 @@ def api_fetch():
     payload["ok"] = True
     payload["download_url"] = own_url
 
-    log.info("<<< REQUEST %s DONE: %s", rid, own_url)
+    log.info("<<< UI REQUEST %s DONE: %s", rid, own_url)
     return jsonify(payload)
 
 
+# ---------------------------------------------------------------------------
+# Public API endpoint (optional API key)
+# ---------------------------------------------------------------------------
+@app.route("/api/v1/fetch", methods=["POST", "OPTIONS"])
+def api_v1_fetch():
+    """
+    Public API. Validates the URL first, then checks the API key.
+
+    POST /api/v1/fetch
+    Body: { "url": "https://www.tiktok.com/@user/video/123..." }
+
+    Response (200):
+        {
+          "ok": true,
+          "source_url": "...",
+          "filename": "tiktok_....mp4",
+          "download_url": "https://your-app.onrender.com/download/tiktok_....mp4",
+          "remote_url": "https://clipssaver.com/api/download/file?...",
+          "size_bytes": 706176,
+          "size_human": "689.62 KB"
+        }
+
+    Errors:
+        400 — missing / bad url
+        401 — missing / invalid API key (only when API_KEY is set)
+        502 — fetch failed
+    """
+    # CORS preflight
+    if request.method == "OPTIONS":
+        resp = jsonify(ok=True)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+        return resp, 204
+
+    # ---- 1. Validate the request body FIRST --------------------------
+    data = request.get_json(silent=True) or request.form or {}
+    tiktok_url = (data.get("url") or request.args.get("url") or "").strip()
+
+    if not tiktok_url:
+        resp = jsonify(ok=False, error="Missing 'url'")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 400
+
+    if "tiktok.com" not in tiktok_url:
+        resp = jsonify(ok=False, error="'url' must be a TikTok URL")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 400
+
+    # ---- 2. THEN check the API key ----------------------------------
+    ok, err = _check_api_key()
+    if not ok:
+        log.warning("API auth failed: %s", err)
+        resp = jsonify(ok=False, error=err)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 401
+
+    # ---- 3. Fetch ----------------------------------------------------
+    rid = uuid.uuid4().hex[:8]
+    _request_id.set(rid)
+    log.info(">>> API v1 REQUEST %s: %s", rid, tiktok_url)
+
+    with FETCH_LOCK:
+        result = fetch_tiktok_video(tiktok_url, FETCH_CFG)
+
+    if not result:
+        log.error("<<< API v1 REQUEST %s FAILED", rid)
+        resp = jsonify(ok=False, error="Fetch failed", request_id=rid)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 502
+
+    payload = {
+        "ok": True,
+        "request_id": rid,
+        "source_url": result.source_url,
+        "filename": result.filename,
+        "download_url": _absolute_download_url(result.filename),
+        "remote_url": result.remote_url,
+        "size_bytes": result.size_bytes,
+        "size_human": _human_size(result.size_bytes),
+    }
+
+    log.info("<<< API v1 REQUEST %s DONE: %s", rid, payload["download_url"])
+
+    resp = jsonify(payload)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp, 200
+
+
+# ---------------------------------------------------------------------------
+# File serving
+# ---------------------------------------------------------------------------
 @app.route("/download/<path:filename>")
 def download_file(filename):
     if "/" in filename or "\\" in filename or filename.startswith("."):
@@ -487,6 +623,9 @@ def download_file(filename):
     )
 
 
+# ---------------------------------------------------------------------------
+# UI log polling
+# ---------------------------------------------------------------------------
 @app.route("/api/logs")
 def api_logs():
     with LOG_LOCK:
@@ -495,17 +634,14 @@ def api_logs():
 
 
 # ===========================================================================
-# Bootstrap logging at import time so Gunicorn picks it up
+# Bootstrap logging at import time (required under Gunicorn)
 # ===========================================================================
-# When running under Gunicorn, `__main__` is never executed, so we have to
-# configure logging at module import time (i.e. when the worker imports app.py).
 setup_logging(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     log_file=os.getenv("LOG_FILE", "./logs/clipssaver.log"),
 )
 _install_buffer_handler()
 
-# Ensure download dir exists at startup
 try:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 except Exception:
@@ -516,6 +652,8 @@ log.info("Flask app initialized")
 log.info("Download dir: %s", DOWNLOAD_DIR)
 log.info("Log level: %s", os.getenv("LOG_LEVEL", "INFO"))
 log.info("Playwright DEBUG: %s", os.getenv("DEBUG", "(unset)"))
+log.info("API key required: %s", "YES" if API_KEY else "NO (public)")
+log.info("Public base URL: %s", PUBLIC_BASE_URL or "(auto from request)")
 log.info("=" * 72)
 
 
