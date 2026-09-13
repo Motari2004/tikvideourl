@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TikTok Downloader</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    #logBox { scroll-behavior: smooth; }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <div class="max-w-3xl mx-auto px-4 py-10">
+
+    <!-- Header -->
+    <header class="mb-8">
+      <h1 class="text-3xl font-bold tracking-tight">
+        TikTok <span class="text-emerald-400">Downloader</span>
+      </h1>
+      <p class="text-slate-400 mt-2 text-sm">
+        Paste a TikTok link. The video is fetched server-side and saved for you.
+      </p>
+    </header>
+
+    <!-- Input card -->
+    <section class="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+      <label for="url" class="block text-sm font-medium text-slate-300 mb-2">
+        TikTok video URL
+      </label>
+      <div class="flex gap-2">
+        <input
+          id="url"
+          type="url"
+          placeholder="https://www.tiktok.com/@user/video/123..."
+          class="mono flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-sm
+                 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent
+                 placeholder-slate-600"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button
+          id="fetchBtn"
+          class="bg-emerald-500 hover:bg-emerald-400 disabled:bg-slate-700 disabled:text-slate-500
+                 text-slate-950 font-semibold px-5 py-2.5 rounded-lg transition-colors
+                 flex items-center gap-2 whitespace-nowrap"
+        >
+          <span id="btnLabel">Fetch video</span>
+          <svg id="spinner" class="hidden animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor"
+                  d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+          </svg>
+        </button>
+      </div>
+
+      <div class="mt-3 text-xs text-slate-500">
+        Tip: use the share button in TikTok to copy the link —
+        <span class="mono">vm.tiktok.com</span> short links work too.
+      </div>
+    </section>
+
+    <!-- Result -->
+    <section id="resultCard" class="hidden mt-5"></section>
+
+    <!-- Live log -->
+    <section class="mt-8">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider">Live log</h2>
+        <button id="clearLog"
+                class="text-xs text-slate-500 hover:text-slate-300 transition-colors">
+          clear
+        </button>
+      </div>
+      <pre id="logBox"
+           class="mono bg-black/60 border border-slate-800 rounded-xl p-3
+                  text-[11px] leading-5 text-slate-400
+                  h-72 overflow-y-auto whitespace-pre-wrap"></pre>
+    </section>
+
+    <footer class="mt-8 text-xs text-slate-600 text-center">
+      Files are saved server-side and served from this app.
+    </footer>
+  </div>
+
+  <script>
+  const $ = (id) => document.getElementById(id);
+  const urlInput   = $("url");
+  const fetchBtn   = $("fetchBtn");
+  const btnLabel   = $("btnLabel");
+  const spinner    = $("spinner");
+  const resultCard = $("resultCard");
+  const logBox     = $("logBox");
+
+  let busy = false;
+  let logCursor = 0;
+
+  // --------------------------------------------------------------------
+  // Live log polling
+  // --------------------------------------------------------------------
+  async function pollLogs() {
+    try {
+      const r = await fetch("/api/logs");
+      const j = await r.json();
+      const lines = j.lines || [];
+      if (lines.length < logCursor) logCursor = 0;
+      const fresh = lines.slice(logCursor);
+      if (fresh.length) {
+        logBox.textContent += (logBox.textContent ? "\n" : "") + fresh.join("\n");
+        logCursor = lines.length;
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+    } catch (e) { /* ignore */ }
+    setTimeout(pollLogs, 1200);
+  }
+  pollLogs();
+
+  $("clearLog").onclick = () => { logBox.textContent = ""; logCursor = 0; };
+
+  // --------------------------------------------------------------------
+  // Helpers
+  // --------------------------------------------------------------------
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, c => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+
+  function humanSize(n) {
+    const units = ["B","KB","MB","GB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return n.toFixed(2) + " " + units[i];
+  }
+
+  async function copyToClipboard(inputEl, btnEl) {
+    const text = inputEl.value;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      inputEl.select();
+      document.execCommand("copy");
+    }
+    const original = btnEl.textContent;
+    btnEl.textContent = "Copied!";
+    setTimeout(() => { btnEl.textContent = original; }, 1500);
+  }
+
+  // --------------------------------------------------------------------
+  // Render success
+  // --------------------------------------------------------------------
+  function renderSuccess(data) {
+    resultCard.className = "mt-5";
+    resultCard.innerHTML = `
+      <div class="bg-emerald-950/40 border border-emerald-800/60 rounded-2xl p-5">
+        <div class="flex items-center gap-2 mb-4">
+          <div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
+          <span class="text-emerald-300 text-sm font-semibold">Video ready</span>
+          <span class="text-emerald-400/60 text-xs ml-auto">
+            ${humanSize(data.size_bytes || 0)}
+          </span>
+        </div>
+
+        <label class="block text-xs uppercase tracking-wider text-slate-400 mb-1">Filename</label>
+        <div class="mono text-sm text-slate-200 mb-5 break-all">${escapeHtml(data.filename || "")}</div>
+
+        <!-- Primary download button (our stable URL) -->
+        <a href="${escapeAttr(data.download_url)}"
+           class="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500
+                  text-white font-semibold px-5 py-2.5 rounded-lg transition-colors mb-6">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Download MP4
+        </a>
+
+        <!-- Remote (clipssaver) URL -->
+        <label class="block text-xs uppercase tracking-wider text-slate-400 mb-1">
+          Direct source URL
+          <span class="normal-case text-slate-500 tracking-normal">
+            (clipssaver — session-bound)
+          </span>
+        </label>
+        <div class="flex gap-2 mb-5">
+          <input id="remoteUrl" readonly value="${escapeAttr(data.remote_url || "")}"
+                 class="mono flex-1 bg-black/60 border border-slate-800 rounded-lg
+                        px-3 py-2 text-xs text-slate-300 focus:outline-none" />
+          <button id="copyRemote"
+                  class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium
+                         px-3 rounded-lg transition-colors whitespace-nowrap">
+            Copy
+          </button>
+          <a href="${escapeAttr(data.remote_url || "#")}" target="_blank" rel="noopener"
+             class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium
+                    px-3 rounded-lg flex items-center transition-colors whitespace-nowrap">
+            Open
+          </a>
+        </div>
+
+        <!-- Our server URL -->
+        <label class="block text-xs uppercase tracking-wider text-slate-400 mb-1">
+          Local server URL
+          <span class="normal-case text-slate-500 tracking-normal">
+            (stable, safe to share)
+          </span>
+        </label>
+        <div class="flex gap-2 mb-5">
+          <input id="localUrl" readonly value="${escapeAttr(location.origin + data.download_url)}"
+                 class="mono flex-1 bg-black/60 border border-emerald-900/60 rounded-lg
+                        px-3 py-2 text-xs text-emerald-200 focus:outline-none" />
+          <button id="copyLocal"
+                  class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium
+                         px-3 rounded-lg transition-colors whitespace-nowrap">
+            Copy
+          </button>
+        </div>
+
+        <div class="text-[11px] text-slate-500 break-all">
+          Source: <span class="mono">${escapeHtml(data.source_url || "")}</span>
+        </div>
+      </div>
+    `;
+
+    $("copyRemote").onclick = () => copyToClipboard($("remoteUrl"), $("copyRemote"));
+    $("copyLocal").onclick  = () => copyToClipboard($("localUrl"),  $("copyLocal"));
+  }
+
+  // --------------------------------------------------------------------
+  // Render error
+  // --------------------------------------------------------------------
+  function renderError(msg) {
+    resultCard.className = "mt-5";
+    resultCard.innerHTML = `
+      <div class="bg-red-950/40 border border-red-800/60 rounded-2xl p-4">
+        <div class="flex items-center gap-2 mb-1">
+          <div class="w-2 h-2 rounded-full bg-red-400"></div>
+          <span class="text-red-300 text-sm font-semibold">Failed</span>
+        </div>
+        <div class="text-red-200/80 text-sm">${escapeHtml(msg)}</div>
+      </div>
+    `;
+  }
+
+  // --------------------------------------------------------------------
+  // Main action
+  // --------------------------------------------------------------------
+  async function doFetch() {
+    if (busy) return;
+    const url = urlInput.value.trim();
+    if (!url) { urlInput.focus(); return; }
+
+    busy = true;
+    fetchBtn.disabled = true;
+    btnLabel.textContent = "Fetching…";
+    spinner.classList.remove("hidden");
+    resultCard.className = "hidden";
+
+    try {
+      const r = await fetch("/api/fetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url })
+      });
+      const data = await r.json();
+      if (data.ok) renderSuccess(data);
+      else         renderError(data.error || "Unknown error");
+    } catch (e) {
+      renderError("Network error: " + e.message);
+    } finally {
+      busy = false;
+      fetchBtn.disabled = false;
+      btnLabel.textContent = "Fetch video";
+      spinner.classList.add("hidden");
+    }
+  }
+
+  fetchBtn.onclick = doFetch;
+  urlInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doFetch();
+  });
+  urlInput.focus();
+  </script>
+</body>
+</html>
