@@ -52,10 +52,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# ---------------------------------------------------------------------------
-# Playwright browser (Chromium only)
-# ---------------------------------------------------------------------------
-RUN playwright install chromium
+# After (installs both the shell and the full browser)
+RUN playwright install --with-deps chromium
 
 # ---------------------------------------------------------------------------
 # App code
