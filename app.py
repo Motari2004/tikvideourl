@@ -1,28 +1,15 @@
 """
-app.py — TikTok → MP4 downloader with web UI.
+app.py — TikTok → MP4 downloader with verbose logging for Render.
 
-Flow:
-    User pastes TikTok URL in browser
-        ↓
-    Server runs headless Chromium via Playwright
-        ↓
-    Fills clipssaver.com form, clicks Get Video → Save Video
-        ↓
-    Downloads bytes using page.request (same session) → ./downloads/
-        ↓
-    Returns both URLs to the browser:
-        - download_url  -> /download/<filename>  (your server, stable)
-        - remote_url    -> clipssaver.com/api/... (session-bound, for reference)
-
-Files needed:
-    app.py
-    templates/index.html
+Every log line is flushed to stdout immediately so it shows up in
+Render's log viewer in real time.
 
 Endpoints:
     GET  /                      -> UI
-    POST /api/fetch             -> { url } -> { ok, filename, download_url, remote_url, source_url, size_bytes }
-    GET  /download/<filename>   -> serves the MP4 as attachment
-    GET  /api/logs              -> live log lines
+    POST /api/fetch             -> fetch a TikTok, save MP4
+    GET  /download/<filename>   -> serve saved MP4
+    GET  /api/logs              -> live log lines for the UI
+    GET  /healthz               -> health check for Render
 """
 
 import logging
@@ -31,10 +18,17 @@ import re
 import sys
 import threading
 import time
+import uuid
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+# Enable Playwright's own debug logging BEFORE importing it.
+# Streams to stderr -> captured by Render.
+# Set to "pw:api" for every action, or "pw:browser" for just browser events.
+os.environ.setdefault("DEBUG", "pw:api")
 
 from flask import (
     Flask, request, jsonify, render_template,
@@ -51,27 +45,60 @@ from playwright.sync_api import (
 # ===========================================================================
 # Logging
 # ===========================================================================
-LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LOG_FORMAT = "%(asctime)s | %(levelname)-7s | [%(request_id)s] | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+_request_id: ContextVar[str] = ContextVar("request_id", default="--------")
+
+
+class _RequestIdFilter(logging.Filter):
+    """Inject the current request id into every log record."""
+    def filter(self, record):
+        record.request_id = _request_id.get()
+        return True
+
+
+class _FlushingStreamHandler(logging.StreamHandler):
+    """
+    StreamHandler that flushes after every emit.
+    Required on Render — stdout is buffered when not attached to a TTY,
+    so logs otherwise sit in a 4KB buffer and appear 'delayed'.
+    """
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
 
 
 def setup_logging(level: int = logging.INFO, log_file: str | None = None) -> logging.Logger:
+    """Configure root logger with a flushing stdout handler + optional file."""
     root = logging.getLogger()
     root.setLevel(level)
+
     for h in list(root.handlers):
         root.removeHandler(h)
 
     formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+    rid_filter = _RequestIdFilter()
 
-    console = logging.StreamHandler(sys.stdout)
+    console = _FlushingStreamHandler(sys.stdout)
     console.setFormatter(formatter)
+    console.addFilter(rid_filter)
     root.addHandler(console)
 
     if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setFormatter(formatter)
-        root.addHandler(fh)
+        try:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setFormatter(formatter)
+            fh.addFilter(rid_filter)
+            root.addHandler(fh)
+        except Exception as e:
+            # Don't crash startup if the filesystem is read-only
+            print(f"[warn] Could not create file log {log_file}: {e}", file=sys.stderr)
+
+    # Quiet noisy libraries
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     return logging.getLogger("clipssaver_fetcher")
 
@@ -102,9 +129,10 @@ def _install_buffer_handler():
         return
     h = _BufferHandler()
     h.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(message)s",
+        "%(asctime)s | %(levelname)-7s | [%(request_id)s] | %(message)s",
         datefmt="%H:%M:%S",
     ))
+    h.addFilter(_RequestIdFilter())
     root.addHandler(h)
 
 
@@ -128,11 +156,11 @@ class FetchConfig:
 
 @dataclass
 class FetchResult:
-    source_url: str        # original TikTok URL
-    filename: str          # saved filename
-    saved_path: str        # absolute local path
-    size_bytes: int        # file size
-    remote_url: str        # clipssaver.com/api/download/file?... (session-bound)
+    source_url: str
+    filename: str
+    saved_path: str
+    size_bytes: int
+    remote_url: str
 
 
 TIKTOK_TOOL_URL = "https://clipssaver.com/tiktok-video-downloader"
@@ -183,13 +211,9 @@ def _human_size(n: int) -> str:
 
 
 # ===========================================================================
-# Fetcher — the core
+# Fetcher
 # ===========================================================================
 def fetch_tiktok_video(tiktok_url: str, cfg: FetchConfig | None = None) -> FetchResult | None:
-    """
-    Run clipssaver end-to-end and save the MP4 to disk.
-    Returns FetchResult on success, None on failure.
-    """
     cfg = cfg or FetchConfig()
     os.makedirs(cfg.download_dir, exist_ok=True)
 
@@ -227,18 +251,29 @@ def fetch_tiktok_video(tiktok_url: str, cfg: FetchConfig | None = None) -> Fetch
 
 
 def _fetch_once(tiktok_url: str, cfg: FetchConfig) -> FetchResult:
-    """Single attempt. Saves file to disk. Raises on failure."""
+    """Single attempt. Every step is logged so Render shows full progress."""
+    t0 = time.time()
+
+    log.info("[step 1/8] Launching Chromium (headless=%s)", cfg.headless)
     with sync_playwright() as p:
-        log.debug("Launching chromium (headless=%s)", cfg.headless)
         browser = p.chromium.launch(
             headless=cfg.headless,
             slow_mo=cfg.slow_mo_ms,
             args=[
+                # Required inside Docker / Render
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--single-process",              # helps with limited memory
+                # Clipboard permissions
                 "--enable-features=ClipboardReadWrite",
                 "--disable-features=ClipboardPermissionPrompt",
             ],
         )
+        log.info("[step 1/8] Chromium launched in %.2fs", time.time() - t0)
 
+        log.info("[step 2/8] Creating browser context")
         context = browser.new_context(
             accept_downloads=True,
             permissions=["clipboard-read", "clipboard-write"],
@@ -252,25 +287,27 @@ def _fetch_once(tiktok_url: str, cfg: FetchConfig) -> FetchResult:
         context.set_default_timeout(cfg.page_timeout_ms)
 
         page = context.new_page()
+        log.info("[step 2/8] Context + page ready")
 
-        page.on("console", lambda msg: log.debug("[browser] %s: %s",
-                                                 msg.type, msg.text))
+        # ---- verbose telemetry -------------------------------------------
+        page.on("console", lambda msg: log.info("[browser console] %s: %s",
+                                                msg.type, msg.text))
         page.on("pageerror", lambda err: log.warning("[page error] %s", err))
 
         def on_request_failed(req):
             if "/api/promo-events" in req.url:
                 return
-            log.debug("[request failed] %s %s", req.method, req.url)
+            log.info("[request failed] %s %s", req.method, req.url)
         page.on("requestfailed", on_request_failed)
-
-        page.on("download", lambda d: log.info(
-            "[download event] suggested=%s url=%s",
-            d.suggested_filename, d.url))
 
         def on_response(resp):
             if "/api/download/file" in resp.url:
                 log.info("[api response] %s %s", resp.status, resp.url)
         page.on("response", on_response)
+
+        page.on("download", lambda d: log.info(
+            "[download event] suggested=%s url=%s",
+            d.suggested_filename, d.url))
 
         def on_dialog(dialog):
             log.info("[dialog] %s: %s — accepting", dialog.type, dialog.message)
@@ -281,34 +318,41 @@ def _fetch_once(tiktok_url: str, cfg: FetchConfig) -> FetchResult:
         page.on("dialog", on_dialog)
 
         try:
-            # 1. Navigate to tool page
-            log.info("Navigating to %s", TIKTOK_TOOL_URL)
+            # ---- 3. navigate ---------------------------------------------
+            log.info("[step 3/8] Navigating to %s", TIKTOK_TOOL_URL)
+            t_nav = time.time()
             page.goto(TIKTOK_TOOL_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(800)
-            log.info("Now on: %s", page.url)
+            log.info("[step 3/8] Now on: %s (%.2fs)",
+                     page.url, time.time() - t_nav)
 
-            # 2. Fill textbox
-            log.info("Filling TikTok URL into textbox")
+            # ---- 4. fill textbox -----------------------------------------
+            log.info("[step 4/8] Filling TikTok URL into textbox")
             url_box = page.get_by_role("textbox", name="Paste TikTok video link")
             url_box.wait_for(state="visible", timeout=15_000)
             url_box.click()
             url_box.fill(tiktok_url)
+            log.info("[step 4/8] Textbox filled")
 
-            # 3. Click "Get Video"
-            log.info("Clicking 'Get Video'")
+            # ---- 5. click Get Video --------------------------------------
+            log.info("[step 5/8] Clicking 'Get Video'")
+            t_get = time.time()
             get_btn = page.get_by_role("button", name="Get Video")
             get_btn.wait_for(state="visible", timeout=cfg.get_video_timeout_ms)
             get_btn.click()
+            log.info("[step 5/8] 'Get Video' clicked")
 
-            # 4. Wait for "Save Video"
-            log.info("Waiting for 'Save Video' button (timeout=%dms)",
+            # ---- 6. wait for Save Video ----------------------------------
+            log.info("[step 6/8] Waiting for 'Save Video' button (timeout=%dms)",
                      cfg.save_video_timeout_ms)
             save_btn = page.get_by_role("button", name="Save Video")
             save_btn.wait_for(state="visible", timeout=cfg.save_video_timeout_ms)
-            log.info("'Save Video' is visible")
+            log.info("[step 6/8] 'Save Video' visible after %.2fs",
+                     time.time() - t_get)
 
-            # 5. Click "Save Video" -> intercept download
-            log.info("Clicking 'Save Video' to capture download")
+            # ---- 7. click Save Video -> capture download -----------------
+            log.info("[step 7/8] Clicking 'Save Video' to capture download")
+            t_dl = time.time()
             with page.expect_download(timeout=cfg.download_timeout_ms) as dl_info:
                 save_btn.click()
 
@@ -318,26 +362,28 @@ def _fetch_once(tiktok_url: str, cfg: FetchConfig) -> FetchResult:
             suggested = api_fname or download.suggested_filename
             safe_name = _sanitize_filename(suggested or "tiktok_video.mp4")
 
-            log.info("Download intercepted")
-            log.info("  remote_url: %s", download_url)
-            log.info("  filename:   %s", safe_name)
+            log.info("[step 7/8] Download intercepted after %.2fs",
+                     time.time() - t_dl)
+            log.info("           remote_url: %s", download_url)
+            log.info("           filename:   %s", safe_name)
 
-            # 6. Fetch bytes using the SAME browser session (page.request)
-            #    The clipssaver URL is session-gated, so this is the only way.
-            log.info("Fetching bytes via page.request (same session)")
+            # ---- 8. fetch bytes via page.request (same session) ----------
+            log.info("[step 8/8] Fetching bytes via page.request (same session)")
+            t_fetch = time.time()
             resp = page.request.get(download_url)
 
             if not resp.ok:
                 body_preview = resp.text()[:300]
-                log.error("page.request failed: HTTP %s — %s",
+                log.error("[step 8/8] page.request failed: HTTP %s — %s",
                           resp.status, body_preview)
                 raise RuntimeError(
                     f"Download failed: HTTP {resp.status} — {body_preview}")
 
             body = resp.body()
-            log.info("Got %s bytes from server", len(body))
+            log.info("[step 8/8] Got %s bytes in %.2fs",
+                     len(body), time.time() - t_fetch)
 
-            # 7. Save to disk
+            # ---- save to disk --------------------------------------------
             save_path = _unique_path(cfg.download_dir, safe_name)
             with open(save_path, "wb") as f:
                 f.write(body)
@@ -347,6 +393,7 @@ def _fetch_once(tiktok_url: str, cfg: FetchConfig) -> FetchResult:
                 raise RuntimeError(f"Downloaded file is empty: {save_path}")
 
             log.info("✅ Saved (%s): %s", _human_size(size), save_path)
+            log.info("Total elapsed: %.2fs", time.time() - t0)
 
             return FetchResult(
                 source_url=tiktok_url,
@@ -357,14 +404,14 @@ def _fetch_once(tiktok_url: str, cfg: FetchConfig) -> FetchResult:
             )
 
         finally:
-            log.debug("Closing browser context")
+            log.info("Closing browser context")
             try:
                 context.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.debug("context.close() raised, ignoring", exc_info=True)
             try:
                 browser.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.debug("browser.close() raised, ignoring", exc_info=True)
 
 
@@ -379,7 +426,7 @@ FETCH_CFG = FetchConfig(
     max_retries=2,
 )
 
-FETCH_LOCK = threading.Lock()   # serialize — one browser at a time
+FETCH_LOCK = threading.Lock()
 
 
 @app.route("/")
@@ -387,38 +434,47 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+
 @app.route("/api/fetch", methods=["POST"])
 def api_fetch():
+    rid = uuid.uuid4().hex[:8]
+    _request_id.set(rid)
+
     data = request.get_json(silent=True) or {}
     tiktok_url = (data.get("url") or "").strip()
 
+    log.info(">>> INCOMING REQUEST %s: %s", rid, tiktok_url)
+
     if not tiktok_url:
+        log.warning("Missing url parameter")
         return jsonify(ok=False, error="Missing 'url' in request body"), 400
     if "tiktok.com" not in tiktok_url:
+        log.warning("Not a TikTok URL")
         return jsonify(ok=False, error="That doesn't look like a TikTok URL"), 400
 
-    log.info("UI request: fetch %s", tiktok_url)
-
     with FETCH_LOCK:
+        log.info("Lock acquired, starting fetch")
         result = fetch_tiktok_video(tiktok_url, FETCH_CFG)
 
     if not result:
+        log.error("<<< REQUEST %s FAILED", rid)
         return jsonify(ok=False, error="Fetch failed. Check the server log."), 502
 
-    # Build OUR server's download URL (stable, never expires)
     own_url = f"/download/{result.filename}"
-
     payload = asdict(result)
     payload["ok"] = True
-    payload["download_url"] = own_url      # /download/<filename>
-    # payload["remote_url"] is already in asdict(result)
+    payload["download_url"] = own_url
 
+    log.info("<<< REQUEST %s DONE: %s", rid, own_url)
     return jsonify(payload)
 
 
 @app.route("/download/<path:filename>")
 def download_file(filename):
-    """Serve a saved MP4 as an attachment."""
     if "/" in filename or "\\" in filename or filename.startswith("."):
         abort(400)
     full = os.path.join(DOWNLOAD_DIR, filename)
@@ -439,12 +495,32 @@ def api_logs():
 
 
 # ===========================================================================
-# Entry point
+# Bootstrap logging at import time so Gunicorn picks it up
+# ===========================================================================
+# When running under Gunicorn, `__main__` is never executed, so we have to
+# configure logging at module import time (i.e. when the worker imports app.py).
+setup_logging(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    log_file=os.getenv("LOG_FILE", "./logs/clipssaver.log"),
+)
+_install_buffer_handler()
+
+# Ensure download dir exists at startup
+try:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+except Exception:
+    pass
+
+log.info("=" * 72)
+log.info("Flask app initialized")
+log.info("Download dir: %s", DOWNLOAD_DIR)
+log.info("Log level: %s", os.getenv("LOG_LEVEL", "INFO"))
+log.info("Playwright DEBUG: %s", os.getenv("DEBUG", "(unset)"))
+log.info("=" * 72)
+
+
+# ===========================================================================
+# Local dev entry point
 # ===========================================================================
 if __name__ == "__main__":
-    setup_logging(level=logging.INFO, log_file="./logs/clipssaver.log")
-    _install_buffer_handler()
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    log.info("Starting app on http://127.0.0.1:5000")
-    log.info("Download dir: %s", DOWNLOAD_DIR)
     app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
